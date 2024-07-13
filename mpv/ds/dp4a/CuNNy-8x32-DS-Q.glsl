@@ -1,4 +1,4 @@
-// CuNNy 8x32 DS
+// CuNNy 8x32 DS (dp4a)
 // Copyright (c) 2024 funnyplanter
 
 // This program is free software; you can redistribute it and/or

@@ -1,4 +1,2 @@
-venv/
-test/
-scripts/fsr
-scripts/fsr.spv
+/venv/
+/test/

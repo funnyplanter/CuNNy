@@ -1,4 +1,4 @@
-// CuNNy 4x12
+// CuNNy 4x12 (dp4a)
 // Copyright (c) 2024 funnyplanter
 
 // This program is free software; you can redistribute it and/or
