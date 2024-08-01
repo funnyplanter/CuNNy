@@ -23,8 +23,10 @@ The `CuNNy-fast` shader is the recommended shader if you're on a slow machine.
 
 Variants:
 - (No-suffix): Trained to be neutral and do no denoising or sharpening.
-- `DS`: Trained to denoise & sharpen images.
-- `NVL`: Trained on VN screenshots/CG.
+- `SOFT`: Trained to anti-alias & produce a soft output. Is probably the most
+  'artifact-free' variant if you don't count blur.
+- `DS`: Trained to denoise & sharpen.
+- `NVL`: Trained to upscale visual novel games & high-quality illustrations.
 
 There are versions of the mpv shaders use 8-bit `dp4a` instructions. They can be
 many times faster than the standard upscaling shader depending on if your
