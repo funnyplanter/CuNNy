@@ -1,9 +1,17 @@
-// lanczos2sharp with antiring, apply after upscaling
+// lanczos2 with antiring, apply after upscaling
 // Copyright (c) 2024 funnyplanter
 // SPDX-License-Identifier: CC0-1.0
 
 //!MAGPIE EFFECT
 //!VERSION 4
+
+//!PARAMETER
+//!LABEL blur
+//!DEFAULT 0.955
+//!MIN 0.95
+//!MAX 1
+//!STEP 0.001
+float blur;
 
 //!TEXTURE
 Texture2D INPUT;
@@ -21,8 +29,8 @@ SamplerState S;
 //!OUT OUTPUT
 float lanczos(float x)
 {
-	float s = 1./0.9549963639785485, kx = 3.1415926535897932*s*x, wx = .5*kx;
-	return x < 1e-5 ? 1. : sin(kx)*sin(wx)/(kx*wx);
+	float s = 1./blur, kx = 3.1415926535897932*s*x, wx = .5*kx;
+	return x < 1e-5 ? 1. : sin(kx)*sin(wx)/(x*x);
 }
 
 #define K(x) lanczos(x)
@@ -51,11 +59,11 @@ float4 Pass1(float2 p)
 			l[y+1][x+1] = L(float3(r.y, g.y, b.y));
 		}
 	}
-	float3 v =
-		wy.x*(wx.x*l[0][0] + wx.y*l[0][1] + wx.z*l[0][2] + wx.w*l[0][3]) + 
-		wy.y*(wx.x*l[1][0] + wx.y*l[1][1] + wx.z*l[1][2] + wx.w*l[1][3]) + 
-		wy.z*(wx.x*l[2][0] + wx.y*l[2][1] + wx.z*l[2][2] + wx.w*l[2][3]) + 
-		wy.w*(wx.x*l[3][0] + wx.y*l[3][1] + wx.z*l[3][2] + wx.w*l[3][3]);
+	float3 v = mul(wy, float4x3(
+		mul(wx, float4x3(l[0][0], l[0][1], l[0][2], l[0][3])), 
+		mul(wx, float4x3(l[1][0], l[1][1], l[1][2], l[1][3])), 
+		mul(wx, float4x3(l[2][0], l[2][1], l[2][2], l[2][3])), 
+		mul(wx, float4x3(l[3][0], l[3][1], l[3][2], l[3][3]))));
 	v = clamp(v, vmin, vmax);
 	return float4(E(v), 1.);
 }
