@@ -13,18 +13,13 @@ args = parser.parse_args()
 with open(args.model, 'rb') as f:
     m = pickle.load(f)
 
-shader = []
-shader_buf = ''
-indent_lvl = 0
-N = sum(1 for x in m.keys() if 'conv' in x and 'weight' in x)
 D = next(m[x] for x in m if 'in' in x and x.endswith('weight')).shape[0]
-RGB = 'fancyluma.weight' in m
+RGB = m.get('rgb', False)
 QUANT = m.get('quant', False)
 QUANT_8 = m.get('quant-8', False)
-stem = Path(args.model).stem
-version = stem[:stem.rfind('-')]
 assert(not RGB)
-crelu = m['crelu']
+stem = Path(args.model).stem
+name = stem[:stem.rfind('-')]
 
 # thanks vim
 OPENBR = '{'
@@ -32,6 +27,9 @@ CLOSEBR = '}'
 
 ndr = lambda *d: np.ndindex(*d)
 
+shader = []
+shader_buf = ''
+indent_lvl = 0
 def flush():
     global shader, shader_buf
     shader += [shader_buf]
@@ -66,10 +64,10 @@ def swizzle(n, i):
     w, h = rectdim(n)
     return i % w, i // w
 
-def prelude(ps, ins, nouts=1, loadfn=False, save=None, header=None, half=True,
-            exts=[], compute=(8, 8), realsz=None):
+def prelude(ps, ins, sz, nouts=1, loadfn=False, save=None, header=None,
+            half=True, exts=[], compute=(8, 8), realsz=None):
     S(f'')
-    S(f'//!DESC CuNNy-{version}-{ps}')
+    S(f'//!DESC CuNNy-{name} : {ps} ({sz[1]}x{sz[0]})')
     S(f'//!HOOK LUMA')
     shuffle = ps == 'out-shuffle'
     w, h = (2, 2) if shuffle else rectdim(nouts)
@@ -117,9 +115,9 @@ def prelude(ps, ins, nouts=1, loadfn=False, save=None, header=None, half=True,
         for i in range(inv[1]):
             iw, ih = rectdim(inv[1])
             x, y = swizzle(inv[1], i)
-            v = (f'{inv[0]}_tex((vec2(clamp(pos + ivec2(x, y), ivec2(0), sz)'
-                 f' * ivec2({iw}, {ih}) + ivec2({x}, {y})) + vec2(0.5)) *'
-                 f' {inv[0]}_pt)')
+            v = (f'({inv[0]}_mul * texelFetch('
+                 f'{inv[0]}_raw, clamp(pos + ivec2(x, y), ivec2(0), sz)'
+                 f' * ivec2({iw}, {ih}) + ivec2({x}, {y}), 0))')
             if half:
                 if inv[0] == 'LUMA':
                     f = f'F({v}.r)'
@@ -129,7 +127,7 @@ def prelude(ps, ins, nouts=1, loadfn=False, save=None, header=None, half=True,
                 f = f'{v}.r' if half else f'{v}'
             S(f'#define l{i}(x, y) {f}')
 
-def write_dp4a(ps, k, actfn, ins, ws, sz, crelup):
+def write_dp4a(ps, k, actfn, ins, ws, sz):
     shuffle = ps == 'out-shuffle'
     assert(len(ins) == (2 if shuffle else 1))
     inv = ins[0]
@@ -138,10 +136,8 @@ def write_dp4a(ps, k, actfn, ins, ws, sz, crelup):
     och = sz[0]
     ich = sz[1]
     d = sz[2]
-    cm = 2 if crelup else 1
     cent = d // 2
     nins = ich // 4
-    nins_uniq = max(nins // cm, 1)
     nouts = och // 4
     iw, ih = rectdim(inv[1])
     gather = iw % 2 == 0 and ih % 2 == 0
@@ -153,7 +149,7 @@ def write_dp4a(ps, k, actfn, ins, ws, sz, crelup):
     ssz = (tsz[0] + d - 1, tsz[1] + d - 1)
 
     tex = f'{ps}'
-    prelude(ps, ins, nouts, loadfn=not gather, save=tex, half=False,
+    prelude(ps, ins, sz, nouts, loadfn=not gather, save=tex, half=False,
             compute=tsz, exts = [
         'GL_EXT_spirv_intrinsics'
     ])
@@ -193,6 +189,7 @@ def write_dp4a(ps, k, actfn, ins, ws, sz, crelup):
     S(f'int ax = xy.x + x;')
     S(f'if (ax >= {ssz[0]}) break;')
     cent = d // 2
+    mul_qfnorm = '' if qf_norm == 1. else f' * {fmt(qf_norm, 7)}'
     if gather:
         S('vec2 p;')
         S(f'vec4 {", ".join(f"{e}" for e in "rgba")};')
@@ -206,28 +203,14 @@ def write_dp4a(ps, k, actfn, ins, ws, sz, crelup):
                 for j, e in enumerate('rgba'):
                     S(f'{e} = {inv[0]}_gather(p, {j});')
                 for j, c in enumerate('wzxy'):
-                    S(f'vec4 v{i+cm*j} = vec4(r.{c}, g.{c}, b.{c}, a.{c}) * '
-                      f'{fmt(qf_norm, 7)};')
-                for j in range(4):
-                    if not crelup:
-                        break
-                    si = i + 2*j
-                    S(f'vec4 v{si+1} = max(-v{si}, vec4(0));')
-                    S(f'v{si} = max(v{si}, vec4(0));')
-                i += 4*cm
+                    S(f'vec4 v{i+j} = vec4(r.{c}, g.{c}, b.{c}, a.{c})'
+                      f'{mul_qfnorm};')
+                i += 4
     else:
-        for i in range(0, nins_uniq):
-            si = 2*i if crelup else i
-            S(f'vec4 v{si} = l{i}(x - {cent}, y - {cent}) * {fmt(qf_norm, 7)};')
-            if crelup:
-                S(f'vec4 v{si + 1} = max(-v{si}, vec4(0));')
-                S(f'v{si} = max(v{si}, vec4(0));')
-    for i in range(0, nins_uniq):
-        si = 2*i if crelup else i
-        store = lambda si: S(f'G[{si}][ay][ax] = int(packSnorm4x8(v{si}));')
-        store(si)
-        if crelup:
-            store(si + 1)
+        for i in range(0, nins):
+            S(f'vec4 v{i} = l{i}(x - {cent}, y - {cent}){mul_qfnorm};')
+    for i in range(0, nins):
+        S(f'G[{i}][ay][ax] = int(packSnorm4x8(v{i}));')
     S(CLOSEBR, t=-1)
     S(CLOSEBR, t=-1)
     S('barrier();')
@@ -260,7 +243,8 @@ def write_dp4a(ps, k, actfn, ins, ws, sz, crelup):
                 si = iidx + i
                 for o in range(vo):
                     so = oidx + o
-                    w = [ws[4*so+j, 4*si:4*(si+1), y, x].astype(np.int8).view(np.uint32).item()
+                    w = [ws[4*so+j, 4*si:4*(si+1), y, x] \
+                            .astype(np.int8).view(np.uint32).item()
                          for j in range(4)]
                     w = ', '.join(f'0x{v:08X}' for v in w)
                     S(f'r{o} = D(r{o}, {l}, {w});')
@@ -307,28 +291,18 @@ def write(ps, k, actfn, ins):
     inv = ins[0]
     ws = m[k+'weight']
     sz = ws.shape
-    crelup = crelu and inv[0] != 'LUMA'
-    cm = 2 if crelup else 1
     och = sz[0]
     ich = sz[1]
     d = sz[2]
 
-    if QUANT_8 and ps != 'in':
+    if QUANT_8 and ps != 'in' and not shuffle:
         ws = ws.clip(-1., 1.)
-
-    if crelup:
-        ws = ws.reshape(sz[0], -1, 4, sz[2], sz[3])
-        half = ws.shape[1] // 2
-        ws = np.dstack((ws[:, :half], -ws[:, half:])).reshape(sz)
 
     # if there's too little math dp4a seems to decrease performance
     DP4A_PERF_THRES = 32
-    # large(r) shaders are for people with relatively alright GPUs, so should be
-    # able to handle final pass in fp16
-    shuffle_fp16 = D >= 16 and shuffle
     if (not args.fp16 and QUANT_8 and ich >= 4 and ich*och >= DP4A_PERF_THRES
-        and not shuffle_fp16):
-        return write_dp4a(ps, k, actfn, ins, ws, sz, crelup)
+        and not shuffle):
+        return write_dp4a(ps, k, actfn, ins, ws, sz)
 
     tex = f'{ps}'
     nouts = och // 4
@@ -337,12 +311,11 @@ def write(ps, k, actfn, ins):
     tsz = (8, 8)
     ssz = (tsz[0] + d - 1, tsz[1] + d - 1)
 
-    prelude(ps, ins, nouts, loadfn=not gather, save=tex, compute=tsz)
+    prelude(ps, ins, sz, nouts, loadfn=not gather, save=tex, compute=tsz)
     stype = 'F' if inv[0] == 'LUMA' else 'V4'
     nins = max(ich // 4, 1)
-    nins_uniq = max(nins // cm, 1)
 
-    S(f'shared {stype} G[{nins_uniq}][{ssz[1]}][{ssz[0]}];')
+    S(f'shared {stype} G[{nins}][{ssz[1]}][{ssz[0]}];')
 
     S(f'void hook() {OPENBR}', t=1)
     S(f'ivec2 xy = ivec2(gl_LocalInvocationID.xy);')
@@ -374,7 +347,7 @@ def write(ps, k, actfn, ins):
                       f'{stype}(sr{i}.{c}, sg{i}.{c}, sb{i}.{c}, sa{i}.{c});')
                 i += 1
     else:
-        for iidx in range(0, nins_uniq):
+        for iidx in range(0, nins):
             S(f'G[{iidx}][ay][ax] = l{iidx}(x - {cent}, y - {cent});')
     S(CLOSEBR, t=-1)
     S(CLOSEBR, t=-1)
@@ -395,21 +368,18 @@ def write(ps, k, actfn, ins):
             vi = min(I, nins - iidx)
 
             sbuf = []
-            for i, y, x, j in ndr(vi // cm, d, d, cm):
-                si = iidx + cm*i + j
-                s = f'G[{si // cm}][xy.y+{y}][xy.x+{x}]'
-                if crelup:
-                    s = (f'max({s}, {stype}(0.0))' if j == 0 else
-                         f'max(-{s}, {stype}(0.0))')
-                sbuf += [f's{cm*i + j}_{y}_{x} = {s};']
+            for i, y, x in ndr(vi, d, d):
+                si = iidx + i
+                s = f'G[{si}][xy.y+{y}][xy.x+{x}]'
+                sbuf += [f's{i}_{y}_{x} = {s};']
                 if len(sbuf) == 2:
                     S(' '.join(sbuf))
                     sbuf = []
             if sbuf:
                 S(' '.join(sbuf))
-            for i, y, x, j in ndr(vi // cm, d, d, cm):
-                si = iidx + cm*i + j
-                l = f's{cm*i + j}_{y}_{x}'
+            for i, y, x in ndr(vi, d, d):
+                si = iidx + i
+                l = f's{i}_{y}_{x}'
                 for o in range(vo):
                     so = oidx + o
                     wstr = weight(ws, x, y, ich, och, d, si, so, l)
@@ -418,7 +388,7 @@ def write(ps, k, actfn, ins):
         for o in range(vo):
             bn = k + 'bias'
             so = oidx + o
-            if bn in m:
+            if bn in m and not np.all(m[bn] < 1e-5):
                 b = [fmt(v.item()) for v in m[bn].ravel()[4*so:4*(so+1)]]
                 S(f'r{o} += V4({", ".join(b)});')
             if actfn:
@@ -465,15 +435,16 @@ lgpl = """
 // License along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-S(f'// CuNNy {version.replace("-", " ")}')
+S(f'// CuNNy {name.replace("-", " ")}{" (dp4a)" if QUANT_8 and not args.fp16 else ""}'
+   ' - https://github.com/funnyplanter/CuNNy')
 S(f'// Copyright (c) 2024 funnyplanter')
 S(lgpl, end='')
-S('/* ------------------------------------------------------------------- */\n')
+S('/* ------------------------------------------------------------------- */')
 
 basetex = 'LUMA'
 texs = [('LUMA', 1)]
 nconv = 1
-relu = 'max(X, T(0.0))' if not crelu else None
+relu = 'clamp(X, T(0.0), T(1.0))' if QUANT else 'max(X, T(0.0))'
 
 for k_ in m:
     suf = 'weight'
@@ -490,7 +461,7 @@ for k_ in m:
         texs = write(f'conv{nconv}', k_, relu, texs)
         nconv += 1
     elif k.startswith('cout'):
-        texs = write('out-shuffle', k_, 'tanh(X)', texs + [(basetex, 1)])
+        texs = write('out-shuffle', k_, None, texs + [(basetex, 1)])
 
 flush()
 
@@ -498,4 +469,3 @@ fp = f'test/CuNNy-{stem}.glsl'
 with open(fp, 'w') as f:
     f.write("".join(shader))
 print(fp)
-
