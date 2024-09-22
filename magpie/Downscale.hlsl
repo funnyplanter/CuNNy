@@ -7,10 +7,10 @@
 
 //!PARAMETER
 //!LABEL blur
-//!DEFAULT 0.955
-//!MIN 0.95
-//!MAX 1
-//!STEP 0.001
+//!DEFAULT 1.0
+//!MIN 0.9
+//!MAX 1.2
+//!STEP 0.01
 float blur;
 
 //!TEXTURE
