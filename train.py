@@ -22,7 +22,7 @@ E = 500
 # batch size
 B = 64
 # learning rate
-LR = 0.0001
+LR = 0.00001
 # max learning rate with OneCycleLR
 MAX_LR = 0.001
 # weight decay
@@ -67,6 +67,8 @@ if has_cuda:
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
+is_win = sys.platform.startswith('win')
+
 def load(dir, file, variants):
     fn = os.path.join(dir, file)
     if not os.path.exists(fn):
@@ -82,9 +84,17 @@ def load(dir, file, variants):
 
 def load_all(pool, dir, files, transform, variants):
     vs = ((dir, file, variants) for file in files)
+    def starmap(fn, args):
+        # TODO: fix multiprocessing
+        if is_win:
+            r = []
+            for arg in args:
+                r += [fn(*arg)]
+            return r
+        return list(pool.starmap(fn, args))
     return [list(map(lambda x: transform(x).to(dev), imgs))
-            for imgs in tqdm.tqdm(list(pool.starmap(load,
-                tqdm.tqdm(vs, total=len(files), desc='loading images'))),
+            for imgs in tqdm.tqdm(starmap(load,
+                tqdm.tqdm(vs, total=len(files), desc='loading images')),
                           desc='transforming images')]
 
 RGB_YCBCR = torch.tensor([
@@ -114,9 +124,11 @@ class Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return self.x[idx], self.y[idx], self.true[idx], self.files[idx]
 
+autocast_dtype = torch.float32 if is_win else torch.bfloat16
+
 transform = v2.Compose([
     v2.PILToTensor(),
-    v2.ConvertImageDtype(torch.bfloat16)
+    v2.ConvertImageDtype(autocast_dtype)
 ])
 dataset = Dataset(f'{gargs.data}/64', f'{gargs.data}/128', transform)
 
@@ -150,6 +162,24 @@ for args in all_args:
     QUANT_F = 127.
     QUANT_DF = 1. / QUANT_F
     use_quant = False
+
+    filename = ''
+    suf = '-' + args.suffix if args.suffix else ''
+    name = NAME + suf
+    version = name
+    i = 0
+    while os.path.exists('models/' + (filename := f'{version}-{i}.pickle')):
+        i += 1
+    writer_name = 'runs/' + filename
+
+    sd = OrderedDict()
+    sd['size'] = SIZE
+    sd['layers'] = LAYERS
+    sd['args'] = sys.argv
+    sd['rgb'] = RGB
+    sd['quant'] = QUANT
+    sd['quant-8'] = QUANT_8
+    sd['name'] = name
 
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=B, shuffle=True, drop_last=True)
@@ -311,6 +341,13 @@ for args in all_args:
                         tuple(x.to(dtype=torch.float32).expand(3, -1, -1)
                             for x in imgs if len(x[0]) > 0) + diffs),
                     global_step=epoch)
+            if not QUANT_8 and epoch % 50 == 0 and epoch != 0:
+                sd['loss'] = avg_loss
+                for k, v in model.state_dict().items():
+                    sd[k] = v.cpu().numpy() if hasattr(v, 'numpy') else v
+                ckpt = filename.replace('.pickle', f'-{epoch:04}.pickle')
+                with open('ckpt/' + ckpt, 'wb') as f:
+                    pickle.dump(sd, f, protocol=pickle.HIGHEST_PROTOCOL)
             if writer:
                 writer.add_scalar('L', avg_loss, epoch + 1)
         return avg_loss
@@ -318,6 +355,8 @@ for args in all_args:
     loss = None
     def run(model, name=None, dev=dev, lr=LR, max_lr=MAX_LR, *, epochs, compile,
             train):
+        if is_win:
+            compile = False
         if train:
             model = model.train()
         else:
@@ -347,24 +386,14 @@ for args in all_args:
 
     if args.test:
         print(f'testing {args.test}')
-        with torch.autocast(dev.type, dtype=torch.bfloat16):
+        with torch.autocast(dev.type, dtype=autocast_dtype):
             run(model, epochs=1, compile=False, train=False)
         continue
 
-    filename = ''
-    suf = '-' + args.suffix if args.suffix else ''
-    name = NAME + suf
-    version = name
-
-    i = 0
-    while os.path.exists((filename := f'models/{version}-{i}.pickle')):
-        i += 1
-    writer_name = filename.replace('models/', 'runs/')
-
     if args.resume:
         print(f'resuming from {args.resume}')
-    print(f'training {filename} ({SIZE})')
-    with torch.autocast(dev.type, dtype=torch.bfloat16):
+    print(f'training models/{filename} ({SIZE})')
+    with torch.autocast(dev.type, dtype=autocast_dtype):
         run(model, name=writer_name, epochs=E, compile=True, train=True)
 
         if QUANT_8:
@@ -385,21 +414,13 @@ for args in all_args:
             act_leak = 0.
             run(model, epochs=1, compile=False, train=False)
 
-    sd = OrderedDict()
+    sd['loss'] = loss.item()
     with open(sys.argv[0]) as f:
         sd['src'] = f.read()
-    sd['size'] = SIZE
-    sd['layers'] = LAYERS
-    sd['args'] = sys.argv
-    sd['loss'] = loss.item()
-    sd['rgb'] = RGB
-    sd['quant'] = QUANT
-    sd['quant-8'] = QUANT_8
-    sd['name'] = name
     for k, v in model.state_dict().items():
         sd[k] = v.cpu().numpy() if hasattr(v, 'numpy') else v
 
-    with open(filename, 'wb') as f:
+    with open('models/' + filename, 'wb') as f:
         pickle.dump(sd, f, protocol=pickle.HIGHEST_PROTOCOL)
     with open('test/last.txt', 'w') as f:
-        f.write(filename)
+        f.write('models/' + filename)

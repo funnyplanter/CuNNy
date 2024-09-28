@@ -56,7 +56,7 @@ Tested training with PyTorch nightly on Linux with Python 3.11. If any errors
 arise try using nightly.
 
 Create folders by running `sh scripts/mkfolders.sh`.
-Prepare data by running `sh scripts/build.sh`, then `sh scripts/split.sh
+Prepare data by running `sh scripts/split.sh
 <input-folder> <output-128-grids>`, then `py scripts/proc.py <128-grids> <out>`.
 
 To train `py train.py <data> <N> <D>` where `N` is the number of internal
