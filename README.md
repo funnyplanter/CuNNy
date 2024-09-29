@@ -23,6 +23,10 @@ Variants:
 - `DS`: Trained to denoise & sharpen.
 - `NVL`: Trained to upscale visual novel games & high-quality illustrations.
 
+Standard model/backend combinations have been pre-generated in this repository.
+More versions of the models for different backends can be generated using the
+webapp: https://funnyplanter.github.io/
+
 ### mpv
 
 mpv shaders are found inside the `mpv/` directory.
