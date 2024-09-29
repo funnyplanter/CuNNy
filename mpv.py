@@ -47,7 +47,7 @@ def prelude(ps, ins, sz, nouts=1, loadfn=False, save=None, header=None,
     ins = [ins[0]] if shuffle else ins
     S(f'//!WIDTH {basetex}.w' + (f' {w} *' if w > 1 else ''))
     S(f'//!HEIGHT {basetex}.h' + (f' {h} *' if h > 1 else ''))
-    S(f'//!COMPONENTS {1 if shuffle else 4}')
+    S(f'//!COMPONENTS {1 if shuffle and not args.rgb else 4}')
     S(f'//!WHEN OUTPUT.w {basetex}.w / 1.3 > OUTPUT.h {basetex}.h / 1.3 > *')
     if half and exts == []:
         S(f'#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable')
