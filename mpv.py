@@ -1,58 +1,18 @@
 # converts the CuNNy model to an mpv usershader
 import numpy as np
-import sys
-import pickle
 import argparse
-from pathlib import Path
-
-parser = argparse.ArgumentParser()
-parser.add_argument('model', type=str)
-parser.add_argument('-f', '--fp16', action='store_true')
-args = parser.parse_args()
-
-with open(args.model, 'rb') as f:
-    m = pickle.load(f)
-
-D = next(m[x] for x in m if 'in' in x and x.endswith('weight')).shape[0]
-RGB = m.get('rgb', False)
-QUANT = m.get('quant', False)
-QUANT_8 = m.get('quant-8', False)
-assert(not RGB)
-stem = Path(args.model).stem
-name = stem[:stem.rfind('-')]
-
-# thanks vim
-OPENBR = '{'
-CLOSEBR = '}'
-
-ndr = lambda *d: np.ndindex(*d)
-
-shader = []
-shader_buf = ''
-indent_lvl = 0
-def flush():
-    global shader, shader_buf
-    shader += [shader_buf]
-    shader_buf = ''
-    
-def S(txt, end='\n', t=0):
-    global shader, shader_buf, indent_lvl
-    if t < 0:
-        indent_lvl += t
-    tabs = indent_lvl * '\t'
-    shader_buf += tabs + ('\n' + tabs).join(txt.split('\n')) + end
-    if t > 0:
-        indent_lvl += t
-    if len(shader_buf) > 1024:
-        flush()
-
-def fmt(v, n=3):
-    return f'{v:.{n}e}' if v != 0 else '.0'
+from common import *
 
 def weight(ws, x, y, ich, och, d, iidx, oidx, l):
-    w = [fmt(v.item()) for v in ws[(4*oidx):(4*(1+oidx)), (4*iidx):(4*(1+iidx)),
-                                   y, x].swapaxes(0, 1).ravel()]
-    return f'{"M4" if len(w) > 4 else "V4"}({", ".join(w)}) * {l}'
+    w = [fmt(v) for v in ws[4*oidx:4*(1+oidx), 4*iidx:4*(1+iidx), y, x]
+                            .swapaxes(0, 1).ravel().tolist()]
+    if ich >= 4:
+        mtype = 'M4'
+    elif ich == 3:
+        mtype = 'M3x4'
+    else:
+        mtype = 'V4'
+    return f'{mtype}({", ".join(w)}) * {l}'
 
 def rectdim(n):
     for i in range(min(int(n ** 0.5), 2), 0, -1):
@@ -67,38 +27,44 @@ def swizzle(n, i):
 def prelude(ps, ins, sz, nouts=1, loadfn=False, save=None, header=None,
             half=True, exts=[], compute=(8, 8), realsz=None):
     S(f'')
-    S(f'//!DESC CuNNy-{name} : {ps} ({sz[1]}x{sz[0]})')
-    S(f'//!HOOK LUMA')
+    S(f'//!DESC CuNNy-{args.name} : {ps} ({sz[1]}x{sz[0]})')
+    S(f'//!HOOK {basetex}')
     shuffle = ps == 'out-shuffle'
     w, h = (2, 2) if shuffle else rectdim(nouts)
     if not realsz:
         realsz = compute
     S(f'//!COMPUTE {realsz[0] * w} {realsz[1] * h} {compute[0]} {compute[1]}')
     if shuffle:
-        if ins[1][0] != 'LUMA':
-            S(f'//!BIND LUMA')
+        if ins[1][0] != basetex:
+            S(f'//!BIND {basetex}')
         save = False
     for inv in ins:
         S(f'//!BIND {inv[0]}')
         if save:
-            if inv[0] != 'LUMA':
-                S(f'//!BIND LUMA')
+            if inv[0] != basetex:
+                S(f'//!BIND {basetex}')
             S(f'//!SAVE {save}')
     ins = [ins[0]] if shuffle else ins
-    S(f'//!WIDTH LUMA.w' + (f' {w} *' if w > 1 else ''))
-    S(f'//!HEIGHT LUMA.h' + (f' {h} *' if h > 1 else ''))
+    S(f'//!WIDTH {basetex}.w' + (f' {w} *' if w > 1 else ''))
+    S(f'//!HEIGHT {basetex}.h' + (f' {h} *' if h > 1 else ''))
     S(f'//!COMPONENTS {1 if shuffle else 4}')
-    S(f'//!WHEN OUTPUT.w LUMA.w / 1.3 > OUTPUT.h LUMA.h / 1.3 > *')
+    S(f'//!WHEN OUTPUT.w {basetex}.w / 1.3 > OUTPUT.h {basetex}.h / 1.3 > *')
     if half and exts == []:
         S(f'#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable')
         S(f'#ifdef GL_EXT_shader_explicit_arithmetic_types_float16')
         S(f'#\tdefine V4 f16vec4')
         S(f'#\tdefine M4 f16mat4')
         S(f'#\tdefine F float16_t')
+        if ps == 'in':
+            S(f'#\tdefine M3x4 f16mat3x4')
+            S(f'#\tdefine V3 f16vec3')
         S(f'#else')
         S(f'#\tdefine V4 vec4')
         S(f'#\tdefine M4 mat4')
         S(f'#\tdefine F float')
+        if ps == 'in':
+            S(f'#\tdefine M3x4 mat3x4')
+            S(f'#\tdefine V3 vec3')
         S(f'#endif')
     else:
         for ext in exts:
@@ -119,8 +85,9 @@ def prelude(ps, ins, sz, nouts=1, loadfn=False, save=None, header=None,
                  f'{inv[0]}_raw, clamp(pos + ivec2(x, y), ivec2(0), sz)'
                  f' * ivec2({iw}, {ih}) + ivec2({x}, {y}), 0))')
             if half:
-                if inv[0] == 'LUMA':
-                    f = f'F({v}.r)'
+                if ps == 'in':
+                    elm = 'rgb' if args.rgb else 'r'
+                    f = f'{"V3" if args.rgb else "F"}({v}.{elm})'
                 else:
                     f = f'V4({v})'
             else:
@@ -131,7 +98,7 @@ def write_dp4a(ps, k, actfn, ins, ws, sz):
     shuffle = ps == 'out-shuffle'
     assert(len(ins) == (2 if shuffle else 1))
     inv = ins[0]
-    assert(inv[0] != 'LUMA')
+    assert(inv[0] != basetex)
 
     och = sz[0]
     ich = sz[1]
@@ -142,7 +109,7 @@ def write_dp4a(ps, k, actfn, ins, ws, sz):
     iw, ih = rectdim(inv[1])
     gather = iw % 2 == 0 and ih % 2 == 0
 
-    stype = 'F' if inv[0] == 'LUMA' else 'V4'
+    stype = 'F' if ps == 'in' else 'V4'
     assert(stype == 'V4')
 
     tsz = (8, 8)
@@ -180,7 +147,7 @@ def write_dp4a(ps, k, actfn, ins, ws, sz):
     S(f'ivec2 pos = ivec2(gl_WorkGroupID.xy) * ivec2({tsz[0]}, {tsz[1]}) + xy;')
     w, h = (2, 2) if shuffle else rectdim(nouts)
     S(f'ivec2 opos = pos * ivec2({w}, {h});')
-    S('ivec2 sz = ivec2(LUMA_size) - ivec2(1);')
+    S(f'ivec2 sz = ivec2({basetex}_size) - ivec2(1);')
 
     S(f'for (int y = 0; y < {ssz[1]}; y += {tsz[1]}) {OPENBR}', t=1)
     S(f'int ay = xy.y + y;')
@@ -230,7 +197,7 @@ def write_dp4a(ps, k, actfn, ins, ws, sz):
             vi = min(I, nins - iidx)
 
             sbuf = []
-            for i, y, x in ndr(vi, d, d):
+            for i, y, x in np.ndindex(vi, d, d):
                 s = f'G[{iidx+i}][xy.y+{y}][xy.x+{x}]'
                 sbuf += [f's{i}_{y}_{x} = {s};']
                 if len(sbuf) == 2:
@@ -238,7 +205,7 @@ def write_dp4a(ps, k, actfn, ins, ws, sz):
                     sbuf = []
             if sbuf:
                 S(' '.join(sbuf))
-            for i, y, x in ndr(vi, d, d):
+            for i, y, x in np.ndindex(vi, d, d):
                 l = f's{i}_{y}_{x}'
                 si = iidx + i
                 for o in range(vo):
@@ -273,9 +240,9 @@ def write_dp4a(ps, k, actfn, ins, ws, sz):
 
     if shuffle:
         base = ins[1][0]
-        S(f'vec2 opt = 0.5 * LUMA_pt;')
+        S(f'vec2 opt = 0.5 * {basetex}_pt;')
         S(f'vec2 fpos = (vec2(opos) + vec2(0.5)) * opt;')
-        for y, x in ndr(2, 2):
+        for y, x in np.ndindex(2, 2):
             c = 'xyzw'[y * 2 + x]
             S(f'imageStore(out_image, opos + ivec2({x}, {y}), '
               f'vec4(f0.{c} + {base}_tex(fpos + vec2({x}.0, {y}.0) * opt).r,'
@@ -295,12 +262,12 @@ def write(ps, k, actfn, ins):
     ich = sz[1]
     d = sz[2]
 
-    if QUANT_8 and ps != 'in' and not shuffle:
+    if args.quant_8 and ps != 'in' and not shuffle:
         ws = ws.clip(-1., 1.)
 
     # if there's too little math dp4a seems to decrease performance
     DP4A_PERF_THRES = 32
-    if (not args.fp16 and QUANT_8 and ich >= 4 and ich*och >= DP4A_PERF_THRES
+    if (not ex_args.fp16 and args.quant_8 and ich >= 4 and ich*och >= DP4A_PERF_THRES
         and not shuffle):
         return write_dp4a(ps, k, actfn, ins, ws, sz)
 
@@ -312,7 +279,9 @@ def write(ps, k, actfn, ins):
     ssz = (tsz[0] + d - 1, tsz[1] + d - 1)
 
     prelude(ps, ins, sz, nouts, loadfn=not gather, save=tex, compute=tsz)
-    stype = 'F' if inv[0] == 'LUMA' else 'V4'
+    stype = 'V4'
+    if ps == 'in':
+        stype = 'V3' if args.rgb else 'F'
     nins = max(ich // 4, 1)
 
     S(f'shared {stype} G[{nins}][{ssz[1]}][{ssz[0]}];')
@@ -322,7 +291,7 @@ def write(ps, k, actfn, ins):
     S(f'ivec2 pos = ivec2(gl_WorkGroupID.xy) * ivec2({tsz[0]}, {tsz[1]}) + xy;')
     w, h = (2, 2) if shuffle else rectdim(nouts)
     S(f'ivec2 opos = pos * ivec2({w}, {h});')
-    S(f'ivec2 sz = ivec2(LUMA_size) - ivec2(1);')
+    S(f'ivec2 sz = ivec2({basetex}_size) - ivec2(1);')
 
     S(f'for (int y = 0; y < {ssz[1]}; y += {tsz[1]}) {OPENBR}', t=1)
     S(f'int ay = xy.y + y;')
@@ -368,7 +337,7 @@ def write(ps, k, actfn, ins):
             vi = min(I, nins - iidx)
 
             sbuf = []
-            for i, y, x in ndr(vi, d, d):
+            for i, y, x in np.ndindex(vi, d, d):
                 si = iidx + i
                 s = f'G[{si}][xy.y+{y}][xy.x+{x}]'
                 sbuf += [f's{i}_{y}_{x} = {s};']
@@ -377,7 +346,7 @@ def write(ps, k, actfn, ins):
                     sbuf = []
             if sbuf:
                 S(' '.join(sbuf))
-            for i, y, x in ndr(vi, d, d):
+            for i, y, x in np.ndindex(vi, d, d):
                 si = iidx + i
                 l = f's{i}_{y}_{x}'
                 for o in range(vo):
@@ -408,19 +377,22 @@ def write(ps, k, actfn, ins):
 
         if shuffle:
             base = ins[1][0]
-            S(f'vec2 opt = 0.5 * LUMA_pt;')
+            S(f'vec2 opt = 0.5 * {basetex}_pt;')
             S(f'vec2 fpos = (vec2(opos) + vec2(0.5)) * opt;')
-            for y, x in ndr(2, 2):
+            for y, x in np.ndindex(2, 2):
                 c = 'xyzw'[y * 2 + x]
+                elm = 'rgb' if args.rgb else 'r'
+                add = f'vec3(r0.{c}, r1.{c}, r2.{c})' if args.rgb else f'r0.{c}'
+                pad = ('0.0, 0.0, ' if not args.rgb else '') + '1.0'
                 S(f'imageStore(out_image, opos + ivec2({x}, {y}), '
-                  f'vec4(r0.{c} + {base}_tex(fpos + vec2({x}.0, {y}.0) * opt).r,'
-                         ' 0.0, 0.0, 1.0));')
+                  f'vec4({add} + {base}_tex(fpos + vec2({x}.0, {y}.0) * opt).{elm},'
+                       f' {pad}));')
 
     S(CLOSEBR, t=-1)
 
     return [(tex, nouts)]
 
-lgpl = """
+LGPL = """
 // This program is free software; you can redistribute it and/or
 // modify it under the terms of the GNU Lesser General Public
 // License as published by the Free Software Foundation; either
@@ -435,37 +407,34 @@ lgpl = """
 // License along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-S(f'// CuNNy {name.replace("-", " ")}{" (dp4a)" if QUANT_8 and not args.fp16 else ""}'
-   ' - https://github.com/funnyplanter/CuNNy')
-S(f'// Copyright (c) 2024 funnyplanter')
-S(lgpl, end='')
-S('/* ------------------------------------------------------------------- */')
+def main(_m, _args, help):
+    global m, args, ex_args, basetex
+    m = _m
+    args = _args
 
-basetex = 'LUMA'
-texs = [('LUMA', 1)]
-nconv = 1
-relu = 'clamp(X, T(0.0), T(1.0))' if QUANT else 'max(X, T(0.0))'
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-f', '--fp16', action='store_true')
+    if help:
+        return parser.format_help()
+    ex_args = parser.parse_args(args.extra)
 
-for k_ in m:
-    suf = 'weight'
-    if not k_.endswith(suf):
-        continue
-    k_ = k_[:-len(suf)]
-    k = k_
-    pref = '_orig_mod.'
-    if k.startswith(pref):
-        k = k[len(pref):-1]
-    if k.startswith('cin'):
-        texs = write('in', k_, relu, texs)
-    elif k.startswith('conv'):
-        texs = write(f'conv{nconv}', k_, relu, texs)
-        nconv += 1
-    elif k.startswith('cout'):
-        texs = write('out-shuffle', k_, None, texs + [(basetex, 1)])
+    S(f'// CuNNy {args.name.replace("-", " ")}{" (dp4a)" if args.quant_8 and not ex_args.fp16 else ""}'
+       ' - https://github.com/funnyplanter/CuNNy')
+    S(f'// Copyright (c) 2024 funnyplanter')
+    S(LGPL, end='')
+    S('/* ------------------------------------------------------------------- */')
 
-flush()
+    basetex = 'MAIN' if args.rgb else 'LUMA'
+    texs = [(basetex, 1)]
+    relu = 'clamp(X, T(0.0), T(1.0))' if args.quant else 'max(X, T(0.0))'
 
-fp = f'test/CuNNy-{stem}.glsl'
-with open(fp, 'w') as f:
-    f.write("".join(shader))
-print(fp)
+    for name, k, n_conv in gen_iter(m):
+        if name.startswith('cin'):
+            texs = write('in', k, relu, texs)
+        elif name.startswith('conv'):
+            texs = write(f'conv{n_conv}', k, relu, texs)
+            n_conv += 1
+        elif name.startswith('cout'):
+            texs = write('out-shuffle', k, None, texs + [(basetex, 1)])
+
+    return f'CuNNy-{args.stem}.glsl', ''.join(get_shader())
